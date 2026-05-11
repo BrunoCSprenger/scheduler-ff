@@ -1,0 +1,47 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    match /users/{uid} {
+      allow read, write: if request.auth != null && request.auth.uid == uid;
+
+      match /groupMemberships/{code} {
+        allow read, write: if request.auth != null && request.auth.uid == uid;
+      }
+    }
+
+    // MVP: any signed-in user can read group metadata when they know [inviteCode].
+    // Tighten later (e.g. only members, or Cloud Functions for join).
+    match /groups/{inviteCode} {
+      allow read: if request.auth != null;
+
+      allow create: if request.auth != null
+        && request.resource.data.ownerId == request.auth.uid
+        && request.resource.data.inviteCode == inviteCode;
+
+      // Owner edits, or members bumping only memberCount (+1) without changing metadata.
+      allow update: if request.auth != null && (
+        resource.data.ownerId == request.auth.uid
+        || (
+          request.resource.data.ownerId == resource.data.ownerId
+          && request.resource.data.name == resource.data.name
+          && request.resource.data.inviteCode == resource.data.inviteCode
+          && request.resource.data.memberCount == resource.data.memberCount + 1
+        )
+      );
+
+      match /members/{memberId} {
+        allow read: if request.auth != null;
+
+        allow create: if request.auth != null
+          && request.auth.uid == memberId
+          && exists(/databases/$(database)/documents/groups/$(inviteCode));
+
+        allow delete: if request.auth != null
+          && request.auth.uid == memberId;
+
+        allow update: if false;
+      }
+    }
+  }
+}

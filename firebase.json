@@ -1,0 +1,29 @@
+{
+    "flutter": {
+      "platforms": {
+        "android": {
+          "default": {
+            "projectId": "scheduler-ff",
+            "appId": "1:770464137791:android:6588818fae9e075a81ee8a",
+            "fileOutput": "android/app/google-services.json"
+          }
+        },
+        "dart": {
+          "lib/firebase_options.dart": {
+            "projectId": "scheduler-ff",
+            "configurations": {
+              "android": "1:770464137791:android:6588818fae9e075a81ee8a",
+              "ios": "1:770464137791:ios:549e93f58d9b417181ee8a",
+              "macos": "1:770464137791:ios:549e93f58d9b417181ee8a",
+              "web": "1:770464137791:web:000aed5c722f4d8081ee8a",
+              "windows": "1:770464137791:web:129fc7d40ec08e0c81ee8a"
+            }
+          }
+        }
+      }
+    },
+    "firestore": {
+      "rules": "firestore.rules",
+      "indexes": "firestore.indexes.json"
+    }
+  }
