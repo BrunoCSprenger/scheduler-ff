@@ -2,6 +2,7 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:scheduler/models/group_summary.dart';
 import 'package:scheduler/screens/availability_screen.dart';
+import 'package:scheduler/screens/group_detail_screen.dart';
 import 'package:scheduler/screens/group_join_create_screen.dart';
 import 'package:scheduler/screens/home_screen.dart';
 import 'package:scheduler/screens/profile_screen.dart';
@@ -17,7 +18,6 @@ class SchedulingShell extends StatefulWidget {
 
 class _SchedulingShellState extends State<SchedulingShell> {
   int _tabIndex = 0;
-  String? _highlightedGroupId;
   final _groupsRepo = GroupRepository();
 
   static const _titles = ['Home', 'Availability', 'Profile'];
@@ -29,10 +29,11 @@ class _SchedulingShellState extends State<SchedulingShell> {
   ];
 
   void _openDrawerSelectGroup(GroupSummary group) {
-    setState(() => _highlightedGroupId = group.inviteCode);
     Navigator.of(context).pop();
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('Selected: ${group.name}')),
+    Navigator.of(context).push<void>(
+      MaterialPageRoute<void>(
+        builder: (context) => GroupDetailScreen(group: group),
+      ),
     );
   }
 
@@ -137,17 +138,11 @@ class _SchedulingShellState extends State<SchedulingShell> {
                         ),
                         ...groups.map(
                           (g) => ListTile(
-                            leading: Icon(
-                              Icons.group_rounded,
-                              color: _highlightedGroupId == g.inviteCode
-                                  ? theme.colorScheme.primary
-                                  : null,
-                            ),
+                            leading: const Icon(Icons.group_rounded),
                             title: Text(g.name),
                             subtitle: Text(
                               '${g.memberCount} members · ${g.inviteCode}',
                             ),
-                            selected: _highlightedGroupId == g.inviteCode,
                             onTap: () => _openDrawerSelectGroup(g),
                           ),
                         ),

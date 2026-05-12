@@ -42,8 +42,29 @@ class _SignInScreenState extends State<SignInScreen> {
       }
     } on FirebaseAuthException catch (e) {
       if (!mounted) return;
+      String msg;
+      switch (e.code) {
+        case 'email-already-in-use':
+          msg = 'That email is already in use.';
+          break;
+        case 'weak-password':
+          msg = 'Password is too weak (min 6 characters).';
+          break;
+        case 'invalid-email':
+          msg = 'Invalid email address.';
+          break;
+        case 'wrong-password':
+          msg = 'Incorrect password.';
+          break;
+        case 'user-not-found':
+          msg = 'No account found for that email.';
+          break;
+        default:
+          msg = e.message ?? 'Authentication failed';
+      }
+
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(e.message ?? 'Authentication failed')),
+        SnackBar(content: Text(msg)),
       );
     } finally {
       if (mounted) setState(() => _busy = false);

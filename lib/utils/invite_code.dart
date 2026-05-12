@@ -2,8 +2,9 @@ import 'dart:math';
 
 import 'package:flutter/services.dart';
 
-/// Digits 1–9 and A–Z excluding **O** (also excludes **0**). Uppercase only.
-const String kInviteAlphabet = '123456789ABCDEFGHIJKLMNPQRSTUVWXYZ';
+/// Unambiguous characters: digits 3,4,7,9 and letters A–Z excluding O, I, S, Z, B, G
+/// (removes visually confusing: 0/O, 1/I, 2/Z, 5/S, 6/G, 8/B). Uppercase only.
+const String kInviteAlphabet = '3479ACDEFHJKLMNPQRTUVWXY';
 
 const int kInviteCodeLength = 6;
 

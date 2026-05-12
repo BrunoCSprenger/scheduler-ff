@@ -1,4 +1,9 @@
 import 'package:flutter/material.dart';
+import 'package:scheduler/services/group_repository.dart';
+import 'package:scheduler/models/group_summary.dart';
+import 'package:intl/intl.dart';
+
+// Shows upcoming scheduled meetings from groups
 
 /// Main landing tab — scheduling UI comes later.
 class HomeScreen extends StatelessWidget {
@@ -7,6 +12,7 @@ class HomeScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final repo = GroupRepository();
 
     return CustomScrollView(
       slivers: [
@@ -34,33 +40,80 @@ class HomeScreen extends StatelessWidget {
             ),
           ),
         ),
+
+        // Upcoming meetings
         SliverPadding(
           padding: const EdgeInsets.symmetric(horizontal: 24),
           sliver: SliverToBoxAdapter(
-            child: Card(
-              elevation: 0,
-              color: theme.colorScheme.surfaceContainerHighest.withValues(
-                alpha: 0.6,
+            child: Padding(
+              padding: const EdgeInsets.only(bottom: 12),
+              child: Text(
+                'Upcoming meetings',
+                style: theme.textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w600),
               ),
-              child: Padding(
-                padding: const EdgeInsets.all(20),
-                child: Row(
-                  children: [
-                    Icon(
-                      Icons.construction_rounded,
-                      size: 40,
-                      color: theme.colorScheme.primary,
-                    ),
-                    const SizedBox(width: 16),
-                    Expanded(
+            ),
+          ),
+        ),
+        SliverPadding(
+          padding: const EdgeInsets.symmetric(horizontal: 24),
+          sliver: SliverToBoxAdapter(
+            child: StreamBuilder<List<GroupSummary>>(
+              stream: repo.watchMyGroups(),
+              builder: (context, snap) {
+                final list = snap.data ?? const <GroupSummary>[];
+                final meetings = list
+                    .where((g) => g.meetingStart != null)
+                    .toList()
+                  ..sort((a, b) => a.meetingStart!.compareTo(b.meetingStart!));
+
+                if (meetings.isEmpty) {
+                  return Card(
+                    elevation: 0,
+                    color: theme.colorScheme.surfaceContainerHighest.withValues(alpha: 0.6),
+                    child: Padding(
+                      padding: const EdgeInsets.all(20),
                       child: Text(
-                        'Main scheduling experience — to be built next.',
-                        style: theme.textTheme.titleMedium,
+                        'No upcoming meetings scheduled.',
+                        style: theme.textTheme.bodyLarge?.copyWith(color: theme.colorScheme.onSurfaceVariant),
                       ),
                     ),
-                  ],
-                ),
-              ),
+                  );
+                }
+
+                return Card(
+                  elevation: 0,
+                  color: theme.colorScheme.surfaceContainerHighest.withValues(alpha: 0.6),
+                  child: Padding(
+                    padding: const EdgeInsets.all(16),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'Reminder',
+                          style: theme.textTheme.titleSmall?.copyWith(fontWeight: FontWeight.w600),
+                        ),
+                        const SizedBox(height: 12),
+                        ...meetings.map((g) {
+                          final dt = g.meetingStart!.toLocal();
+                          final dur = g.meetingDurationMinutes ?? 0;
+                          final end = dt.add(Duration(minutes: dur));
+                          final meetingText = g.role == 'owner'
+                              ? '${DateFormat.yMMMd().format(dt)} ${DateFormat.jm().format(dt)}–${DateFormat.jm().format(end)}'
+                              : '${DateFormat.yMMMd().add_jm().format(dt)} • $dur minutes';
+
+                          return Padding(
+                            padding: const EdgeInsets.only(bottom: 8),
+                            child: Text(
+                              '${g.name}: $meetingText',
+                              style: theme.textTheme.bodyLarge,
+                            ),
+                          );
+                        }),
+                      ],
+                    ),
+                  ),
+                );
+              },
             ),
           ),
         ),

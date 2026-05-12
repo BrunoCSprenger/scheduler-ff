@@ -2,8 +2,21 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
 
+    function isGroupMember(inviteCode) {
+      return request.auth != null && (
+        exists(/databases/$(database)/documents/groups/$(inviteCode)/members/$(request.auth.uid))
+        || exists(/databases/$(database)/documents/users/$(request.auth.uid)/groupMemberships/$(inviteCode))
+      );
+    }
+
     match /users/{uid} {
       allow read, write: if request.auth != null && request.auth.uid == uid;
+
+      // Allow read/write access to per-user meta documents (e.g. baseAvailability)
+      // so the client can store small per-user settings and templates.
+      match /meta/{metaDoc} {
+        allow read, write: if request.auth != null && request.auth.uid == uid;
+      }
 
       match /groupMemberships/{code} {
         allow read, write: if request.auth != null && request.auth.uid == uid;
@@ -19,28 +32,69 @@ service cloud.firestore {
         && request.resource.data.ownerId == request.auth.uid
         && request.resource.data.inviteCode == inviteCode;
 
-      // Owner edits, or members bumping only memberCount (+1) without changing metadata.
       allow update: if request.auth != null && (
-        resource.data.ownerId == request.auth.uid
-        || (
-          request.resource.data.ownerId == resource.data.ownerId
+        // Owner can rename group (and optionally update updatedAt) only.
+        (
+          request.auth.uid == resource.data.ownerId
+          && request.resource.data.ownerId == resource.data.ownerId
+          && request.resource.data.inviteCode == resource.data.inviteCode
+          && request.resource.data.memberCount == resource.data.memberCount
+        )
+        ||
+        // Join flow increments memberCount only.
+        (
+          (
+            existsAfter(/databases/$(database)/documents/groups/$(inviteCode)/members/$(request.auth.uid))
+            || existsAfter(/databases/$(database)/documents/users/$(request.auth.uid)/groupMemberships/$(inviteCode))
+          )
+          && request.resource.data.ownerId == resource.data.ownerId
           && request.resource.data.name == resource.data.name
           && request.resource.data.inviteCode == resource.data.inviteCode
           && request.resource.data.memberCount == resource.data.memberCount + 1
         )
+        ||
+        // Leave flow decrements memberCount, optionally transferring ownership.
+        (
+          isGroupMember(inviteCode)
+          && request.resource.data.name == resource.data.name
+          && request.resource.data.inviteCode == resource.data.inviteCode
+          && request.resource.data.memberCount == resource.data.memberCount - 1
+          && (
+            request.resource.data.ownerId == resource.data.ownerId
+            || (
+              request.auth.uid == resource.data.ownerId
+              && exists(/databases/$(database)/documents/groups/$(inviteCode)/members/$(request.resource.data.ownerId))
+            )
+          )
+        )
       );
+
+      allow delete: if request.auth != null
+        && resource.data.memberCount <= 1
+        && request.auth.uid == resource.data.ownerId;
 
       match /members/{memberId} {
         allow read: if request.auth != null;
 
         allow create: if request.auth != null
-          && request.auth.uid == memberId
-          && exists(/databases/$(database)/documents/groups/$(inviteCode));
+          && request.auth.uid == memberId;
 
         allow delete: if request.auth != null
           && request.auth.uid == memberId;
 
-        allow update: if false;
+        allow update: if request.auth != null
+          && request.auth.uid == memberId;
+      }
+
+      match /availability/{availabilityId} {
+        allow read: if isGroupMember(inviteCode);
+
+        allow create, update: if request.auth != null
+          && request.resource.data.uid == request.auth.uid
+          && isGroupMember(inviteCode);
+
+        allow delete: if request.auth != null
+          && resource.data.uid == request.auth.uid;
       }
     }
   }
