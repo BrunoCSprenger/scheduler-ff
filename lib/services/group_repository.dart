@@ -2,6 +2,7 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:scheduler/models/group_summary.dart';
 import 'package:scheduler/utils/invite_code.dart';
+import 'package:scheduler/services/timezone_service.dart';
 
 const int _maxCreatedGroups = 10;
 
@@ -305,6 +306,35 @@ class GroupRepository {
     return false;
   }
 
+  Future<void> deleteCurrentUserAccount() async {
+    final user = _user;
+    if (user == null) throw StateError('Not signed in');
+
+    final membershipSnap = await _memberships(user.uid).get();
+    for (final doc in membershipSnap.docs) {
+      try {
+        await leaveGroup(doc.id);
+      } catch (_) {
+        // Continue cleanup even if one group cannot be left.
+      }
+    }
+
+    final batch = _db.batch();
+
+    final metaSnap = await _userDoc(user.uid).collection('meta').get();
+    for (final doc in metaSnap.docs) {
+      batch.delete(doc.reference);
+    }
+
+    final leftoverMembershipSnap = await _memberships(user.uid).get();
+    for (final doc in leftoverMembershipSnap.docs) {
+      batch.delete(doc.reference);
+    }
+
+    batch.delete(_userDoc(user.uid));
+    await batch.commit();
+  }
+
   Future<void> renameGroup({
     required String rawCode,
     required String newName,
@@ -388,13 +418,15 @@ class GroupRepository {
     return _groupDoc(code).get();
   }
 
-  Stream<List<GroupSummary>> watchMyGroups() {
+  Stream<List<GroupSummary>> watchMyGroups({String? viewerTimezone}) {
     final user = _user;
     if (user == null) {
       return Stream.value([]);
     }
 
     return _memberships(user.uid).snapshots().asyncMap((snap) async {
+      final effectiveViewerTimezone =
+          viewerTimezone ?? await _timezoneForUser(user.uid);
       final summaries = <GroupSummary>[];
       for (final doc in snap.docs) {
         final code = doc.id;
@@ -421,7 +453,12 @@ class GroupRepository {
         int? meetingDuration;
         if (meeting != null) {
           final ts = meeting['start'];
-          if (ts is Timestamp) meetingStart = ts.toDate();
+          if (ts is Timestamp) {
+            meetingStart = TimezoneService.convertDateTime(
+              ts.toDate(),
+              effectiveViewerTimezone,
+            );
+          }
           meetingDuration = (meeting['durationMinutes'] as num?)?.toInt();
         }
 
@@ -439,6 +476,20 @@ class GroupRepository {
       summaries.sort((a, b) => a.name.compareTo(b.name));
       return summaries;
     });
+  }
+
+  Future<String> _timezoneForUser(String uid) async {
+    final doc = await _db
+        .collection('users')
+        .doc(uid)
+        .collection('meta')
+        .doc('settings')
+        .get();
+    final timezone = doc.data()?['timezone'] as String?;
+    if (timezone != null && timezone.trim().isNotEmpty) {
+      return timezone.trim();
+    }
+    return TimezoneService.getDeviceTimezone();
   }
 }
 

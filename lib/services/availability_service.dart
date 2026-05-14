@@ -1,6 +1,7 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
+import 'package:scheduler/services/timezone_service.dart';
 
 class AvailabilityService {
   AvailabilityService({FirebaseFirestore? firestore, FirebaseAuth? auth})
@@ -12,6 +13,16 @@ class AvailabilityService {
 
   User? get _user => _auth.currentUser;
 
+  Future<void> _ensureUserMirror() async {
+    final user = _user;
+    if (user == null) return;
+    await _db.collection('users').doc(user.uid).set({
+      'email': user.email,
+      'displayName': user.displayName,
+      'updatedAt': FieldValue.serverTimestamp(),
+    }, SetOptions(merge: true));
+  }
+
   /// Save availability for current user in a group for a specific week.
   /// [dayChunks] maps day index (0-6) to multiple availability ranges.
   /// [weekId] format: "2026-W19" (ISO week) or "2026-05-05" (Monday anchor)
@@ -22,6 +33,7 @@ class AvailabilityService {
   }) async {
     final user = _user;
     if (user == null) throw StateError('Not signed in');
+    final timezone = await getCurrentUserTimezone();
 
     final chunks = <String, List<Map<String, double>>>{};
     dayChunks.forEach((day, ranges) {
@@ -39,6 +51,7 @@ class AvailabilityService {
     await docRef.set({
       'uid': user.uid,
       'weekId': weekId,
+      'timezone': timezone,
       'dayChunks': chunks,
       'updatedAt': FieldValue.serverTimestamp(),
     }, SetOptions(merge: true));
@@ -49,6 +62,7 @@ class AvailabilityService {
   Stream<Map<String, Map<int, List<RangeValues>>>> watchGroupAvailability({
     required String inviteCode,
     required String weekId,
+    required String viewerTimezone,
   }) {
     // Watch per-week availability and, when the current user has no explicit
     // per-week entry, merge in their base availability so it applies to every
@@ -60,10 +74,16 @@ class AvailabilityService {
         .where('weekId', isEqualTo: weekId)
         .snapshots()
         .asyncMap((snapshot) async {
-          final result = <String, Map<int, List<RangeValues>>>{};
+          final rawResult = <String, Map<int, List<RangeValues>>>{};
+          final sourceTimezones = <String, String>{};
           for (final doc in snapshot.docs) {
             final data = doc.data();
             final uid = data['uid'] as String? ?? doc.id.split('_').first;
+            final docTimezone = (data['timezone'] as String?)?.trim();
+            sourceTimezones[uid] =
+                (docTimezone != null && docTimezone.isNotEmpty)
+                ? docTimezone
+                : (uid == _user?.uid ? await getCurrentUserTimezone() : 'UTC');
             final dayChunksMap =
                 data['dayChunks'] as Map<String, dynamic>? ?? {};
             final dayChunks = <int, List<RangeValues>>{};
@@ -101,13 +121,13 @@ class AvailabilityService {
               }
             }
 
-            result[uid] = dayChunks;
+            rawResult[uid] = dayChunks;
           }
 
           // If the current user has no per-week availability in this group, try
           // to merge their base availability from `users/{uid}/meta/baseAvailability`.
           final user = _user;
-          if (user != null && !result.containsKey(user.uid)) {
+          if (user != null && !rawResult.containsKey(user.uid)) {
             final baseDoc = await _db
                 .collection('users')
                 .doc(user.uid)
@@ -116,6 +136,11 @@ class AvailabilityService {
                 .get();
             if (baseDoc.exists) {
               final data = baseDoc.data() ?? {};
+              final baseTimezone = (data['timezone'] as String?)?.trim();
+              sourceTimezones[user.uid] =
+                  (baseTimezone != null && baseTimezone.isNotEmpty)
+                  ? baseTimezone
+                  : await getCurrentUserTimezone();
               final dayChunksMap =
                   data['dayChunks'] as Map<String, dynamic>? ?? {};
               final dayChunks = <int, List<RangeValues>>{};
@@ -134,11 +159,23 @@ class AvailabilityService {
                 }
                 dayChunks[day] = ranges;
               });
-              result[user.uid] = dayChunks;
+              rawResult[user.uid] = dayChunks;
             }
           }
 
-          return result;
+          final referenceMonday = TimezoneService.mondayFromWeekId(weekId);
+          final converted = <String, Map<int, List<RangeValues>>>{};
+          for (final entry in rawResult.entries) {
+            final uid = entry.key;
+            final sourceTimezone = sourceTimezones[uid] ?? 'UTC';
+            converted[uid] = TimezoneService.convertWeeklyAvailability(
+              sourceDayChunks: entry.value,
+              sourceTimezone: sourceTimezone,
+              targetTimezone: viewerTimezone,
+              referenceMonday: referenceMonday,
+            );
+          }
+          return converted;
         });
   }
 
@@ -169,6 +206,7 @@ class AvailabilityService {
           .map((range) => {'start': range.start, 'end': range.end})
           .toList();
     });
+    final timezone = await getCurrentUserTimezone();
 
     final docRef = _db
         .collection('users')
@@ -176,9 +214,61 @@ class AvailabilityService {
         .collection('meta')
         .doc('baseAvailability');
     await docRef.set({
+      'timezone': timezone,
       'dayChunks': chunks,
       'updatedAt': FieldValue.serverTimestamp(),
     }, SetOptions(merge: true));
+  }
+
+  Future<void> saveUserTimezone(String timezone) async {
+    final user = _user;
+    if (user == null) throw StateError('Not signed in');
+
+    await _ensureUserMirror();
+    await _db
+        .collection('users')
+        .doc(user.uid)
+        .collection('meta')
+        .doc('settings')
+        .set({
+          'timezone': timezone,
+          'updatedAt': FieldValue.serverTimestamp(),
+        }, SetOptions(merge: true));
+  }
+
+  Stream<String> watchCurrentUserTimezone() {
+    final user = _user;
+    if (user == null) return Stream.value('UTC');
+
+    return _db
+        .collection('users')
+        .doc(user.uid)
+        .collection('meta')
+        .doc('settings')
+        .snapshots()
+        .asyncMap((snap) async {
+          final timezone = snap.data()?['timezone'] as String?;
+          if (timezone != null && timezone.trim().isNotEmpty) {
+            return timezone.trim();
+          }
+          return TimezoneService.getDeviceTimezone();
+        });
+  }
+
+  Future<String> getCurrentUserTimezone() async {
+    final user = _user;
+    if (user == null) return TimezoneService.getDeviceTimezone();
+    final doc = await _db
+        .collection('users')
+        .doc(user.uid)
+        .collection('meta')
+        .doc('settings')
+        .get();
+    final timezone = doc.data()?['timezone'] as String?;
+    if (timezone != null && timezone.trim().isNotEmpty) {
+      return timezone.trim();
+    }
+    return TimezoneService.getDeviceTimezone();
   }
 
   /// Watch the current user's base availability.

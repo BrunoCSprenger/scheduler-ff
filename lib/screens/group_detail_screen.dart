@@ -5,13 +5,11 @@ import 'package:intl/intl.dart';
 import 'package:scheduler/models/group_summary.dart';
 import 'package:scheduler/services/availability_service.dart';
 import 'package:scheduler/services/group_repository.dart';
+import 'package:scheduler/services/timezone_service.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 
 class GroupDetailScreen extends StatefulWidget {
-  const GroupDetailScreen({
-    required this.group,
-    super.key,
-  });
+  const GroupDetailScreen({required this.group, super.key});
 
   final GroupSummary group;
 
@@ -24,11 +22,13 @@ class _GroupDetailScreenState extends State<GroupDetailScreen> {
   final _groupRepository = GroupRepository();
   final _auth = FirebaseAuth.instance;
 
-  late String _currentWeekId;
+  DateTime? _currentWeekStart;
+  String? _viewerTimezone;
   late String _groupName;
   DateTime? _groupMeetingStart;
   int? _groupMeetingDurationMinutes;
   StreamSubscription<Map<String, Map<int, List<RangeValues>>>?>? _myAvailSub;
+  StreamSubscription<String>? _timezoneSub;
   Map<int, List<RangeValues>> _dayChunks = {
     for (var day = 0; day < 7; day++) day: <RangeValues>[],
   };
@@ -39,32 +39,74 @@ class _GroupDetailScreenState extends State<GroupDetailScreen> {
   bool _isSlidingChunk = false;
   bool _overlapWarnedThisSlide = false;
 
-  static const List<int> _meetingMinuteChunks = [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55];
+  static const List<int> _meetingMinuteChunks = [
+    0,
+    5,
+    10,
+    15,
+    20,
+    25,
+    30,
+    35,
+    40,
+    45,
+    50,
+    55,
+  ];
 
   @override
   void initState() {
     super.initState();
-    _currentWeekId = _getWeekId(DateTime.now());
     _groupName = widget.group.name;
+    _loadViewerTimezone();
     _loadGroupMeta();
-    _subscribeToMyAvailability();
+  }
+
+  DateTime get _currentWeekStartValue =>
+      _currentWeekStart ??= _viewerTimezone == null
+      ? _normalizeToMonday(DateTime.now())
+      : TimezoneService.currentWeekMonday(_viewerTimezone!);
+
+  String get _currentWeekId => _getWeekId(_currentWeekStartValue);
+
+  Future<void> _loadViewerTimezone() async {
+    _timezoneSub?.cancel();
+    _timezoneSub = _availabilityService.watchCurrentUserTimezone().listen((
+      timezone,
+    ) {
+      if (!mounted) return;
+      setState(() {
+        final previousTimezone = _viewerTimezone;
+        _viewerTimezone = timezone;
+        if (_currentWeekStart == null || previousTimezone == null) {
+          _currentWeekStart = TimezoneService.currentWeekMonday(timezone);
+        }
+      });
+      _subscribeToMyAvailability();
+    });
   }
 
   void _subscribeToMyAvailability() {
+    final viewerTimezone = _viewerTimezone;
+    if (viewerTimezone == null) return;
     _myAvailSub?.cancel();
     _myAvailSub = _availabilityService
-        .watchGroupAvailability(inviteCode: widget.group.inviteCode, weekId: _currentWeekId)
+        .watchGroupAvailability(
+          inviteCode: widget.group.inviteCode,
+          weekId: _currentWeekId,
+          viewerTimezone: viewerTimezone,
+        )
         .listen((map) {
-      final uid = _auth.currentUser?.uid;
-      if (uid == null) return;
-      final myChunks = map[uid] ?? <int, List<RangeValues>>{};
-      setState(() {
-        _dayChunks = {
-          for (var day = 0; day < 7; day++)
-            day: List<RangeValues>.from(myChunks[day] ?? <RangeValues>[]),
-        };
-      });
-    }, onError: (_) {});
+          final uid = _auth.currentUser?.uid;
+          if (uid == null) return;
+          final myChunks = map[uid] ?? <int, List<RangeValues>>{};
+          setState(() {
+            _dayChunks = {
+              for (var day = 0; day < 7; day++)
+                day: List<RangeValues>.from(myChunks[day] ?? <RangeValues>[]),
+            };
+          });
+        }, onError: (_) {});
   }
 
   Future<void> _loadGroupMeta() async {
@@ -78,7 +120,8 @@ class _GroupDetailScreenState extends State<GroupDetailScreen> {
         if (ts is Timestamp) start = ts.toDate();
         setState(() {
           _groupMeetingStart = start;
-          _groupMeetingDurationMinutes = (raw['durationMinutes'] as num?)?.toInt();
+          _groupMeetingDurationMinutes = (raw['durationMinutes'] as num?)
+              ?.toInt();
         });
       }
     } catch (_) {}
@@ -137,43 +180,47 @@ class _GroupDetailScreenState extends State<GroupDetailScreen> {
       setState(() {
         _groupName = trimmed;
       });
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Group renamed')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Group renamed')));
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Could not rename group: $e')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Could not rename group: $e')));
     } finally {
       if (mounted) setState(() => _renaming = false);
     }
   }
 
   String _getWeekId(DateTime date) {
-    final weekStart = date.weekday == 7
-        ? date
-        : date.add(Duration(days: 1 - date.weekday));
+    final weekStart = _normalizeToMonday(date);
     final weekNum =
-        ((weekStart.difference(DateTime(weekStart.year, 1, 4)).inDays) ~/ 7) + 1;
+        ((weekStart.difference(DateTime(weekStart.year, 1, 4)).inDays) ~/ 7) +
+        1;
     return '${weekStart.year}-W${weekNum.toString().padLeft(2, '0')}';
   }
 
-  DateTime _getMonday(String weekId) {
-    final parts = weekId.split('-W');
-    final year = int.parse(parts[0]);
-    final week = int.parse(parts[1]);
-    final jan4 = DateTime(year, 1, 4);
-    final dayOffset = jan4.weekday == 7 ? 0 : jan4.weekday - 1;
-    final ref = jan4.subtract(Duration(days: dayOffset));
-    return ref.add(Duration(days: (week - 1) * 7));
+  DateTime _normalizeToMonday(DateTime date) {
+    final localDate = DateTime(date.year, date.month, date.day);
+    return localDate.subtract(
+      Duration(days: localDate.weekday - DateTime.monday),
+    );
+  }
+
+  DateTime _shiftDateByDays(DateTime date, int days) {
+    return DateTime(date.year, date.month, date.day + days);
+  }
+
+  DateTime _meetingStartLocal() {
+    final start = _groupMeetingStart;
+    if (start == null) return DateTime.now();
+    return start.isUtc ? start.toLocal() : start;
   }
 
   void _resetWeek(DateTime monday) {
-    _currentWeekId = _getWeekId(monday);
-    _dayChunks = {
-      for (var day = 0; day < 7; day++) day: <RangeValues>[],
-    };
+    _currentWeekStart = _normalizeToMonday(monday);
+    _dayChunks = {for (var day = 0; day < 7; day++) day: <RangeValues>[]};
     _expandedDay = null;
     _subscribeToMyAvailability();
   }
@@ -191,8 +238,6 @@ class _GroupDetailScreenState extends State<GroupDetailScreen> {
     }
     return '${_formatTime(range.start)}-${_formatTime(range.end)}';
   }
-
-
 
   String _formatRanges(List<RangeValues> ranges) {
     if (ranges.isEmpty) return 'No availability';
@@ -232,7 +277,10 @@ class _GroupDetailScreenState extends State<GroupDetailScreen> {
       for (final raw in source.skip(1)) {
         final next = _snapHalfHourRange(raw);
         if (next.start <= current.end + epsilon) {
-          current = RangeValues(current.start, next.end > current.end ? next.end : current.end);
+          current = RangeValues(
+            current.start,
+            next.end > current.end ? next.end : current.end,
+          );
         } else {
           merged.add(current);
           current = next;
@@ -275,7 +323,9 @@ class _GroupDetailScreenState extends State<GroupDetailScreen> {
       final shouldWarn = !_isSlidingChunk || !_overlapWarnedThisSlide;
       if (shouldWarn) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Chunks cannot overlap on the same day.')),
+          const SnackBar(
+            content: Text('Chunks cannot overlap on the same day.'),
+          ),
         );
         if (_isSlidingChunk) {
           _overlapWarnedThisSlide = true;
@@ -301,7 +351,9 @@ class _GroupDetailScreenState extends State<GroupDetailScreen> {
     }
 
     ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('No non-overlapping slot left on this day.')),
+      const SnackBar(
+        content: Text('No non-overlapping slot left on this day.'),
+      ),
     );
   }
 
@@ -351,12 +403,8 @@ class _GroupDetailScreenState extends State<GroupDetailScreen> {
     return count;
   }
 
-  bool _isMeetingCell(
-    DateTime weekMonday,
-    int dayIndex,
-    int halfHourIndex,
-  ) {
-    final start = _groupMeetingStart?.toLocal();
+  bool _isMeetingCell(DateTime weekMonday, int dayIndex, int halfHourIndex) {
+    final start = _groupMeetingStart == null ? null : _meetingStartLocal();
     final duration = _groupMeetingDurationMinutes;
     if (start == null || duration == null || duration <= 0) return false;
 
@@ -372,7 +420,8 @@ class _GroupDetailScreenState extends State<GroupDetailScreen> {
     final meetingStartMinutes = (start.hour * 60) + start.minute;
     final meetingEndMinutes = meetingStartMinutes + duration;
 
-    return meetingStartMinutes < cellEndMinutes && meetingEndMinutes > cellStartMinutes;
+    return meetingStartMinutes < cellEndMinutes &&
+        meetingEndMinutes > cellStartMinutes;
   }
 
   Widget _buildAvailabilityTable(
@@ -432,7 +481,10 @@ class _GroupDetailScreenState extends State<GroupDetailScreen> {
               padding: const EdgeInsets.symmetric(horizontal: 6),
               decoration: BoxDecoration(
                 border: Border(
-                  top: BorderSide(color: borderColor, width: isHourStart ? 1.2 : 0.7),
+                  top: BorderSide(
+                    color: borderColor,
+                    width: isHourStart ? 1.2 : 0.7,
+                  ),
                 ),
               ),
               child: Text(
@@ -452,13 +504,15 @@ class _GroupDetailScreenState extends State<GroupDetailScreen> {
                   final color = isMeeting
                       ? const Color(0xFFD32F2F)
                       : Color.lerp(
-                          const Color(0xFFE8F5E9),
-                          const Color(0xFF2E7D32),
-                          ratio,
-                        ) ?? const Color(0xFFE8F5E9);
+                              const Color(0xFFE8F5E9),
+                              const Color(0xFF2E7D32),
+                              ratio,
+                            ) ??
+                            const Color(0xFFE8F5E9);
 
                   return Tooltip(
-                    message: '${_dayName(day)} ${_formatTime(timeValue)} · $count/$members members',
+                    message:
+                        '${_dayName(day)} ${_formatTime(timeValue)} · $count/$members members',
                     child: Container(
                       height: 14,
                       decoration: BoxDecoration(
@@ -519,14 +573,14 @@ class _GroupDetailScreenState extends State<GroupDetailScreen> {
         dayChunks: merged,
       );
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Availability saved')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Availability saved')));
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Error: $e')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Error: $e')));
     } finally {
       if (mounted) setState(() => _saving = false);
     }
@@ -557,7 +611,9 @@ class _GroupDetailScreenState extends State<GroupDetailScreen> {
 
     setState(() => _leaving = true);
     try {
-      final deleted = await _groupRepository.leaveGroup(widget.group.inviteCode);
+      final deleted = await _groupRepository.leaveGroup(
+        widget.group.inviteCode,
+      );
       if (!mounted) return;
       final messenger = ScaffoldMessenger.of(context);
       Navigator.of(context).pop(true);
@@ -566,18 +622,23 @@ class _GroupDetailScreenState extends State<GroupDetailScreen> {
       );
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Could not leave group: $e')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Could not leave group: $e')));
     } finally {
       if (mounted) setState(() => _leaving = false);
     }
   }
 
   Future<void> _setMeeting() async {
+    final initialMeetingStart = _meetingStartLocal();
     final date = await showDatePicker(
       context: context,
-      initialDate: _groupMeetingStart ?? DateTime.now(),
+      initialDate: DateTime(
+        initialMeetingStart.year,
+        initialMeetingStart.month,
+        initialMeetingStart.day,
+      ),
       firstDate: DateTime.now().subtract(const Duration(days: 365)),
       lastDate: DateTime.now().add(const Duration(days: 365 * 2)),
     );
@@ -586,12 +647,18 @@ class _GroupDetailScreenState extends State<GroupDetailScreen> {
     final time = await showTimePicker(
       context: context,
       initialTime: _groupMeetingStart != null
-          ? TimeOfDay.fromDateTime(_groupMeetingStart!)
+          ? TimeOfDay.fromDateTime(_meetingStartLocal())
           : TimeOfDay(hour: 12, minute: 0),
     );
     if (time == null) return;
 
-    final chosen = DateTime(date.year, date.month, date.day, time.hour, time.minute);
+    final chosen = DateTime(
+      date.year,
+      date.month,
+      date.day,
+      time.hour,
+      time.minute,
+    );
     final duration = await showDialog<int>(
       context: context,
       builder: (context) => _MeetingDurationDialog(
@@ -601,8 +668,8 @@ class _GroupDetailScreenState extends State<GroupDetailScreen> {
         initialMinutes: _groupMeetingDurationMinutes == null
             ? 0
             : _meetingMinuteChunks.contains(_groupMeetingDurationMinutes! % 60)
-                ? _groupMeetingDurationMinutes! % 60
-                : ((_groupMeetingDurationMinutes! % 60) ~/ 5) * 5,
+            ? _groupMeetingDurationMinutes! % 60
+            : ((_groupMeetingDurationMinutes! % 60) ~/ 5) * 5,
       ),
     );
     if (duration == null) return;
@@ -619,10 +686,14 @@ class _GroupDetailScreenState extends State<GroupDetailScreen> {
         _groupMeetingStart = chosen.toUtc();
         _groupMeetingDurationMinutes = duration;
       });
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Meeting set')));
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Meeting set')));
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Could not set meeting: $e')));
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Could not set meeting: $e')));
     } finally {
       if (mounted) setState(() => _renaming = false);
     }
@@ -631,33 +702,40 @@ class _GroupDetailScreenState extends State<GroupDetailScreen> {
   Future<void> _clearMeeting() async {
     setState(() => _renaming = true);
     try {
-      await _groupRepository.clearGroupMeeting(rawCode: widget.group.inviteCode);
+      await _groupRepository.clearGroupMeeting(
+        rawCode: widget.group.inviteCode,
+      );
       if (!mounted) return;
       setState(() {
         _groupMeetingStart = null;
         _groupMeetingDurationMinutes = null;
       });
-      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Meeting cleared')));
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(const SnackBar(content: Text('Meeting cleared')));
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Could not clear meeting: $e')));
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Could not clear meeting: $e')));
     } finally {
       if (mounted) setState(() => _renaming = false);
     }
   }
 
   void _previousWeek() {
-    final monday = _getMonday(_currentWeekId).subtract(const Duration(days: 7));
+    final monday = _shiftDateByDays(_currentWeekStartValue, -7);
     setState(() => _resetWeek(monday));
   }
 
   void _nextWeek() {
-    final monday = _getMonday(_currentWeekId).add(const Duration(days: 7));
+    final monday = _shiftDateByDays(_currentWeekStartValue, 7);
     setState(() => _resetWeek(monday));
   }
 
   @override
   void dispose() {
+    _timezoneSub?.cancel();
     _myAvailSub?.cancel();
     super.dispose();
   }
@@ -672,7 +750,9 @@ class _GroupDetailScreenState extends State<GroupDetailScreen> {
           children: [
             DrawerHeader(
               decoration: BoxDecoration(
-                color: theme.colorScheme.primaryContainer.withValues(alpha: 0.35),
+                color: theme.colorScheme.primaryContainer.withValues(
+                  alpha: 0.35,
+                ),
               ),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -788,7 +868,9 @@ class _GroupDetailScreenState extends State<GroupDetailScreen> {
                                   ? const SizedBox(
                                       width: 16,
                                       height: 16,
-                                      child: CircularProgressIndicator(strokeWidth: 2),
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 2,
+                                      ),
                                     )
                                   : const Icon(Icons.edit_rounded),
                               label: const Text('Rename group'),
@@ -803,16 +885,23 @@ class _GroupDetailScreenState extends State<GroupDetailScreen> {
                                 if (_groupMeetingStart != null) ...[
                                   Builder(
                                     builder: (context) {
-                                      final dtLocal = _groupMeetingStart!.toLocal();
-                                      final dur = _groupMeetingDurationMinutes ?? 0;
-                                      final end = dtLocal.add(Duration(minutes: dur));
-                                      final meetingText = '${DateFormat.yMMMd().format(dtLocal)} ${DateFormat.jm().format(dtLocal)}–${DateFormat.jm().format(end)}';
+                                      final dtLocal = _meetingStartLocal();
+                                      final dur =
+                                          _groupMeetingDurationMinutes ?? 0;
+                                      final end = dtLocal.add(
+                                        Duration(minutes: dur),
+                                      );
+                                      final meetingText =
+                                          '${DateFormat.yMMMd().format(dtLocal)} ${DateFormat.jm().format(dtLocal)}–${DateFormat.jm().format(end)}';
                                       return Column(
-                                        crossAxisAlignment: CrossAxisAlignment.start,
+                                        crossAxisAlignment:
+                                            CrossAxisAlignment.start,
                                         children: [
                                           Text(
                                             'Scheduled: $meetingText',
-                                            style: Theme.of(context).textTheme.bodySmall,
+                                            style: Theme.of(
+                                              context,
+                                            ).textTheme.bodySmall,
                                           ),
                                           const SizedBox(height: 8),
                                         ],
@@ -879,7 +968,10 @@ class _GroupDetailScreenState extends State<GroupDetailScreen> {
           child: Column(
             children: [
               Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 14,
+                ),
                 child: Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
@@ -1023,8 +1115,12 @@ class _GroupDetailScreenState extends State<GroupDetailScreen> {
 
   @override
   Widget build(BuildContext context) {
+    if (_viewerTimezone == null) {
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
+
     final theme = Theme.of(context);
-    final monday = _getMonday(_currentWeekId);
+    final monday = _currentWeekStartValue;
 
     return Scaffold(
       appBar: AppBar(
@@ -1041,7 +1137,7 @@ class _GroupDetailScreenState extends State<GroupDetailScreen> {
       ),
       endDrawer: _buildMembersDrawer(context),
       body: ListView(
-        padding: const EdgeInsets.only(bottom: 16),
+        padding: const EdgeInsets.fromLTRB(20, 16, 20, 96),
         children: [
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
@@ -1083,7 +1179,7 @@ class _GroupDetailScreenState extends State<GroupDetailScreen> {
             ),
           ),
           Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
             child: Column(
               children: List.generate(
                 7,
@@ -1097,14 +1193,14 @@ class _GroupDetailScreenState extends State<GroupDetailScreen> {
           ),
           const Divider(),
           Padding(
-            padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+            padding: const EdgeInsets.fromLTRB(20, 16, 20, 8),
             child: Text(
               'Group Availability',
               style: theme.textTheme.titleMedium,
             ),
           ),
           Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 8),
             child: StreamBuilder<List<GroupMember>>(
               stream: _availabilityService.watchGroupMembers(
                 inviteCode: widget.group.inviteCode,
@@ -1119,6 +1215,7 @@ class _GroupDetailScreenState extends State<GroupDetailScreen> {
                   stream: _availabilityService.watchGroupAvailability(
                     inviteCode: widget.group.inviteCode,
                     weekId: _currentWeekId,
+                    viewerTimezone: _viewerTimezone!,
                   ),
                   builder: (context, snapshot) {
                     if (snapshot.hasError) {
@@ -1160,7 +1257,8 @@ class _GroupDetailScreenState extends State<GroupDetailScreen> {
                           final displayName = member?.displayName ?? entry.key;
                           final dayChunks = entry.value;
                           final dayLines = List<String>.generate(7, (day) {
-                            final ranges = dayChunks[day] ?? const <RangeValues>[];
+                            final ranges =
+                                dayChunks[day] ?? const <RangeValues>[];
                             return '${_dayShortName(day)}: ${_formatRanges(ranges)}';
                           });
 
@@ -1169,7 +1267,8 @@ class _GroupDetailScreenState extends State<GroupDetailScreen> {
                             child: ListTile(
                               contentPadding: EdgeInsets.zero,
                               leading: CircleAvatar(
-                                backgroundColor: theme.colorScheme.primaryContainer,
+                                backgroundColor:
+                                    theme.colorScheme.primaryContainer,
                                 child: Text(
                                   _memberInitials(displayName),
                                   style: theme.textTheme.labelLarge?.copyWith(
@@ -1195,7 +1294,7 @@ class _GroupDetailScreenState extends State<GroupDetailScreen> {
             ),
           ),
           Padding(
-            padding: const EdgeInsets.all(16),
+            padding: const EdgeInsets.fromLTRB(20, 16, 20, 28),
             child: SizedBox(
               width: double.infinity,
               child: FilledButton(
@@ -1233,7 +1332,20 @@ class _MeetingDurationDialogState extends State<_MeetingDurationDialog> {
   int _hours = 0;
   int _minutes = 0;
 
-  static const List<int> _minuteChunks = [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55];
+  static const List<int> _minuteChunks = [
+    0,
+    5,
+    10,
+    15,
+    20,
+    25,
+    30,
+    35,
+    40,
+    45,
+    50,
+    55,
+  ];
 
   @override
   void initState() {
@@ -1242,9 +1354,9 @@ class _MeetingDurationDialogState extends State<_MeetingDurationDialog> {
     _minutes = _minuteChunks.contains(widget.initialMinutes)
         ? widget.initialMinutes
         : ((_minuteChunks.firstWhere(
-              (m) => m >= widget.initialMinutes,
-              orElse: () => 0,
-            )));
+            (m) => m >= widget.initialMinutes,
+            orElse: () => 0,
+          )));
   }
 
   @override
